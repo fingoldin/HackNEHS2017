@@ -6,6 +6,7 @@
 #include <map>
 #include <vector>
 #include <string.h>
+#include <sys/time.h>
 
 #include "player.hh"
 
@@ -49,6 +50,8 @@ public:
 	Server()
 	{
 		server_fd = 0;
+		firstloop = true;
+		lastID = 0;
 	}
 
 	int init()
@@ -64,10 +67,18 @@ public:
 
 		servaddr.sin_family = AF_INET;
 		servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
-		servaddr.sin_port = htons(SERVER_PORT);
+		servaddr.sin_port = htons(PORT);
 
 		if(bind(server_fd, (struct sockaddr*)&servaddr, sizeof(servaddr)) < 0) {
 			printf("Socket binding failed\n");
+			return 1;
+		}
+
+		struct timeval tv;
+		tv.tv_sec = RECEIVE_TIMEOUT_S;
+		tv.tv_usec = RECEIVE_TIMEOUT_US;
+		if (setsockopt(server_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+			printf("Could not set timeout\n");
 			return 1;
 		}
 
@@ -76,88 +87,83 @@ public:
 
 	void loop()
 	{
-		receive_packet_t data = receivePacket();
+		double dt = 0.01;
 
-		if(data.pid)
-		{
-	//		handleInputPacket(data);
-
-	//		sendOutputPackets();
+		if(firstloop) {
+			gettimeofday(&time, NULL);
+			firstloop = false;
 		}
+		else {
+			struct timeval p_time;
+			memcpy(&p_time, &time, sizeof(struct timeval));
+
+			gettimeofday(&time, NULL);
+
+			dt = (double)(time.tv_sec - p_time.tv_sec) + 0.000001 * (double)(time.tv_usec - p_time.tv_usec);
+		}
+
+		receivePacket();
+
+		for(std::map<unsigned long, Player*>::iterator it = players.begin(); it != players.end(); it++)
+			it->second->loop(dt);
+
+		sendOutputPackets();
+
+		printf("dt: %f\n", dt);
 	}
 
 private:
 
-	receive_packet_t receivePacket()
+	void receivePacket()
 	{
-		receive_packet_t packet;
-
 		char buf[RECEIVE_BUFSIZE];
 
 		struct sockaddr_in remote_addr;
 		socklen_t addr_len = sizeof(remote_addr);
 
-		printf("before\n");
 
 		int recvlen = recvfrom(server_fd, buf, RECEIVE_BUFSIZE, 0, (struct sockaddr*)&remote_addr, &addr_len);
-		printf("after\n");
-		if(recvlen == 4) {
-			packet.pid = *(uint16_t*)&buf[0];
-			packet.type = *(uint8_t*)&buf[2];
-			packet.command_type = *(uint8_t*)&buf[3];
+		if(recvlen > -1)
+			buf[recvlen] = '\0';
+
+		if(recvlen == strlen(CONNECT_SIGNATURE) && strcmp(buf, CONNECT_SIGNATURE) == 0) {
+			handleConnect(remote_addr.sin_addr.s_addr);
 		}
-		else
-			packet.pid = 0;
+		else if(recvlen == (strlen(COMMAND_SIGNATURE) + 1) && strcmp(buf + 1, COMMAND_SIGNATURE) == 0) {
+			std::map<unsigned long, Player*>::iterator player = players.find(remote_addr.sin_addr.s_addr);
+
+			if(player != players.end())
+                        	handleCommand((PacketCommandType)*(uint8_t*)&buf[0], player->second);
+		}
 
 		printf("received %d bytes\n", recvlen);
-
-
-		return packet;
-	}
-
-	void handleInputPacket(receive_packet_t packet)
-	{
-		Player *player = players[packet.pid];
-
-                if(!player)
-                        printf("Packet with unrecognized player id received\n");
-                else
-                {
-                        switch(packet.type)
-                        {
-                        case PT_COMMAND:
-                                handleCommand(packet, player);
-                                break;
-                        case PT_CONNECT:
-                                handleConnect(packet, player);
-                                break;
-                        default:
-                                printf("Packet of unrecognized type received\n");
-                        };
-                }
 	}
 
 	void sendOutputPackets()
 	{
-		send_packet_t packet;
+		int data_len = players.size() * 15;
+		char *data = (char*)malloc(data_len);
 
                 // send positions and animation frames
-                for(std::map<int, Player*>::iterator it = players.begin(); it != players.end(); it++)
+		int i = 0;
+                for(std::map<unsigned long, Player*>::iterator it = players.begin(); it != players.end(); it++)
                 {
+			*(uint16_t*)(i * 15 + data) = it->second->getID();
+			*(float*)(i * 15 + data + 2) = it->second->getXPos();
+			*(float*)(i * 15 + data + 6) = it->second->getYPos();
+			*(float*)(i * 15 + data + 10) = it->second->getAnimPos();
+			data[i * 15 + 14] = (uint8_t)it->second->getAnimID();
 
-                }
+			i++;
+        	}
 
-                sendPacket(packet);
+		for(std::map<unsigned long, Player*>::iterator it = players.begin(); it != players.end(); it++)
+                	sendPacket(it->first, data, data_len);
 	}
 
-	void sendPacket(send_packet_t packet)
+	void handleCommand(PacketCommandType type, Player *player)
 	{
-
-	}
-
-	void handleCommand(receive_packet_t packet, Player *player)
-	{
-		switch(packet.command_type)
+		switch(type)
 		{
 		case PCT_LEFT_P:
 			player->applyForce(-10.0, 0.0);
@@ -179,12 +185,42 @@ private:
 		}
 	}
 
-	void handleConnect(receive_packet_t packet, Player *player)
+	void handleConnect(unsigned long ip)
 	{
+		char confirmation[] = CONNECT_CONFIRMATION;
 
+		if(sendPacket(ip, confirmation, strlen(confirmation)) == 0)
+			players.insert(std::pair<unsigned long, Player*>(ip, new Player(ip, getNextID())));
+	}
+
+	int sendPacket(unsigned long ip, char *buf, int buf_len)
+	{
+		struct sockaddr_in dest_addr;
+		memset((char*)&dest_addr, 0, sizeof(dest_addr));
+		dest_addr.sin_family = AF_INET;
+		dest_addr.sin_port = htons(PORT);
+		dest_addr.sin_addr.s_addr = ip;
+
+		if(sendto(server_fd, buf, buf_len, 0, (struct sockaddr*)&dest_addr, sizeof(dest_addr)) < 0) {
+			printf("Sendto failed\n");
+			return 1;
+		}
+
+		return 0;
+	}
+
+	uint16_t getNextID()
+	{
+		return ++lastID;
 	}
 
 	int server_fd;
 
-	std::map<int, Player*> players;
+	uint16_t lastID;
+
+	bool firstloop;
+
+	struct timeval time;
+
+	std::map<unsigned long, Player*> players;
 };
