@@ -10,7 +10,7 @@ public class Scheduler {
 	static private Player localPlayer;
 	
 	static void init() {
-		
+		addPlayer("Player", true);
 	}
 	
 	static Player LocalPlayer() {
@@ -56,7 +56,7 @@ public class Scheduler {
 		}
 	}
 	
-	static void cleanup() {
+	public static void cleanup() {
 		
 	}
 }
